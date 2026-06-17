@@ -283,6 +283,37 @@
         fn();
     };
 
+    ///**
+    // * @this {AsyncXHRBuffer|AsyncXHRPartfileBuffer|AsyncFileBuffer}
+    // */
+    //AsyncXHRBuffer.prototype.get_block_cache = function()
+    //{
+    //    var count = Object.keys(this.block_cache).length;
+
+    //    var buffer = new Uint8Array(count * BLOCK_SIZE);
+    //    var indices = [];
+
+    //    var i = 0;
+    //    for(var index of Object.keys(this.block_cache))
+    //    {
+    //        var block = this.block_cache.get(index);
+    //        dbg_assert(block.length === BLOCK_SIZE);
+    //        index = +index;
+    //        indices.push(index);
+    //        buffer.set(
+    //            block,
+    //            i * BLOCK_SIZE
+    //        );
+    //        i++;
+    //    }
+
+    //    return {
+    //        buffer,
+    //        indices,
+    //        block_size: BLOCK_SIZE,
+    //    };
+    //};
+
     /**
      * @this {AsyncXHRBuffer|AsyncXHRPartfileBuffer|AsyncFileBuffer}
      */
@@ -334,7 +365,7 @@
      */
     function AsyncXHRPartfileBuffer(filename, size, fixed_chunk_size, partfile_alt_format)
     {
-        const parts = filename.match(/(.*)(\..*)/); 
+        const parts = filename.match(/(.*)(\..*)/)
 
         if(parts)
         {
@@ -472,6 +503,7 @@
     AsyncXHRPartfileBuffer.prototype.get_from_cache = AsyncXHRBuffer.prototype.get_from_cache;
     AsyncXHRPartfileBuffer.prototype.set = AsyncXHRBuffer.prototype.set;
     AsyncXHRPartfileBuffer.prototype.handle_read = AsyncXHRBuffer.prototype.handle_read;
+    //AsyncXHRPartfileBuffer.prototype.get_block_cache = AsyncXHRBuffer.prototype.get_block_cache;
     AsyncXHRPartfileBuffer.prototype.get_state = AsyncXHRBuffer.prototype.get_state;
     AsyncXHRPartfileBuffer.prototype.set_state = AsyncXHRBuffer.prototype.set_state;
 
@@ -680,7 +712,7 @@
                     }
                     else
                     {
-                        const error = "`Range: bytes=...` header not supported (Got `" + header + "`)";
+                        const error = "`Range: bytes=...` header not supported (Got `" + header + "`)"
                         cb(error);
                     }
                 },
