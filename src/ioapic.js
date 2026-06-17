@@ -1,0 +1,3 @@
+"use strict";
+
+// ioapic placeholder
