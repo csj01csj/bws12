@@ -312,9 +312,25 @@ pub unsafe fn instr16_0F01_6_mem(addr: i32) {
 pub unsafe fn instr32_0F01_6_mem(addr: i32) { instr16_0F01_6_mem(addr) }
 
 #[no_mangle]
-pub unsafe fn instr16_0F01_7_reg(_r: i32) { trigger_ud(); }
+pub unsafe fn instr16_0F01_7_reg(r: i32) {
+    // r=0: SWAPGS; r=1: RDTSCP; others: #UD
+    if r == 0 {
+        // SWAPGS: swap GS.base with IA32_KERNEL_GS_BASE
+        if *cpl != 0 {
+            trigger_gp(0);
+            return;
+        }
+        let gs_base = *segment_offsets.offset(GS as isize);
+        *segment_offsets.offset(GS as isize) = *kernel_gs_base_low;
+        *kernel_gs_base_low = gs_base;
+        // high halves remain 0 (32-bit address space)
+    }
+    else {
+        trigger_ud();
+    }
+}
 #[no_mangle]
-pub unsafe fn instr32_0F01_7_reg(_r: i32) { trigger_ud(); }
+pub unsafe fn instr32_0F01_7_reg(r: i32) { instr16_0F01_7_reg(r); }
 
 #[no_mangle]
 pub unsafe fn instr16_0F01_7_mem(addr: i32) {
@@ -415,7 +431,63 @@ pub unsafe fn instr32_0F03_reg(r1: i32, r: i32) {
 #[no_mangle]
 pub unsafe fn instr_0F04() { undefined_instruction(); }
 #[no_mangle]
-pub unsafe fn instr_0F05() { undefined_instruction(); }
+pub unsafe fn instr_0F05() {
+    // SYSCALL - Fast System Call (requires EFER.SCE=1)
+    if *efer & EFER_SCE == 0 {
+        dbg_log!("SYSCALL but EFER.SCE=0, #UD");
+        undefined_instruction();
+        return;
+    }
+    if !*protected_mode {
+        dbg_log!("SYSCALL in real mode, #UD");
+        undefined_instruction();
+        return;
+    }
+
+    // Save return RIP in RCX (next instruction after SYSCALL)
+    let return_rip = get_real_eip();
+    write_reg32(ECX, return_rip);
+    *reg64_high.offset(ECX as isize) = 0; // zero-extend to 64-bit
+
+    // Save RFLAGS in R11 (reg_r8_low[3] = R11)
+    let rflags = get_eflags();
+    *reg_r8_low.offset(3) = rflags;
+    *reg_r8_high.offset(3) = 0;
+
+    // Apply FMASK: mask flags according to IA32_FMASK
+    let new_flags = rflags & !(*msr_fmask) & FLAGS_MASK | FLAGS_DEFAULT;
+    *flags = new_flags & !FLAG_TRAP & !FLAG_VM & !FLAG_RF & !FLAG_INTERRUPT;
+    *flags_changed = 0;
+
+    // Load CS and SS from STAR[47:32] (kernel CS base selector)
+    // STAR[63:32] is in msr_star_high: bits [15:0]=kernel_cs, bits [31:16]=user_cs
+    let kernel_cs = (*msr_star_high as u32 & 0xFFFF) as i32 & !3; // ring 0
+    let kernel_ss = kernel_cs + 8;
+
+    // Set CPL=0
+    *cpl = 0;
+    cpl_changed();
+
+    // Set CS for 64-bit kernel
+    *sreg.offset(CS as isize) = kernel_cs as u16;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_limits.offset(CS as isize) = !0u32;
+    *segment_offsets.offset(CS as isize) = 0;
+    update_cs_size(true); // 32-bit default (64-bit ops done with REX.W)
+
+    // Set SS for kernel
+    *sreg.offset(SS as isize) = kernel_ss as u16;
+    *segment_is_null.offset(SS as isize) = false;
+    *segment_limits.offset(SS as isize) = !0u32;
+    *segment_offsets.offset(SS as isize) = 0;
+    *stack_size_32 = true;
+
+    // Jump to LSTAR (target address for 64-bit SYSCALL)
+    let lstar = *msr_lstar_low; // use low 32 bits (addresses fit in 32 bits for now)
+    *instruction_pointer = get_seg_cs() + lstar;
+
+    dbg_log!("syscall: rip={:x} lstar={:x} cs={:x}", return_rip, lstar, kernel_cs);
+}
 #[no_mangle]
 pub unsafe fn instr_0F06() {
     // clts
@@ -431,7 +503,57 @@ pub unsafe fn instr_0F06() {
     };
 }
 #[no_mangle]
-pub unsafe fn instr_0F07() { undefined_instruction(); }
+pub unsafe fn instr_0F07() {
+    // SYSRET - Return from Fast System Call
+    if *efer & EFER_SCE == 0 {
+        dbg_log!("SYSRET but EFER.SCE=0, #UD");
+        undefined_instruction();
+        return;
+    }
+    if !*protected_mode || *cpl != 0 {
+        dbg_log!("SYSRET: not protected or cpl!=0, #GP");
+        trigger_gp(0);
+        return;
+    }
+
+    // Restore RIP from RCX (saved by SYSCALL)
+    let new_rip = read_reg32(ECX);
+
+    // Restore RFLAGS from R11 (reg_r8_low[3])
+    let new_rflags = *reg_r8_low.offset(3);
+
+    // Get user CS selector from STAR[63:48] (high 16 bits of msr_star_high)
+    let user_cs_base = ((*msr_star_high as u32) >> 16) as i32;
+    let user_cs = (user_cs_base & !3) | 3; // force RPL=3
+    let user_ss = ((user_cs_base & !3) + 8) | 3;
+
+    // Set CPL=3
+    *cpl = 3;
+    cpl_changed();
+
+    // Load user CS
+    *sreg.offset(CS as isize) = user_cs as u16;
+    *segment_is_null.offset(CS as isize) = false;
+    *segment_limits.offset(CS as isize) = !0u32;
+    *segment_offsets.offset(CS as isize) = 0;
+    update_cs_size(true);
+
+    // Load user SS
+    *sreg.offset(SS as isize) = user_ss as u16;
+    *segment_is_null.offset(SS as isize) = false;
+    *segment_limits.offset(SS as isize) = !0u32;
+    *segment_offsets.offset(SS as isize) = 0;
+    *stack_size_32 = true;
+
+    // Restore RFLAGS
+    *flags = new_rflags & FLAGS_MASK | FLAGS_DEFAULT;
+    *flags_changed = 0;
+
+    // Jump to restored RIP
+    *instruction_pointer = get_seg_cs() + new_rip;
+
+    dbg_log!("sysret: rip={:x} cs={:x}", new_rip, user_cs);
+}
 #[no_mangle]
 pub unsafe fn instr_0F08() {
     // invd
@@ -1214,9 +1336,30 @@ pub unsafe fn instr_0F30() {
     else if index == IA32_MCG_CAP {
         // netbsd
     }
+    else if index == IA32_EFER {
+        // Cannot change LME while paging is enabled
+        let pg_enabled = *cr & CR0_PG != 0;
+        if pg_enabled && ((*efer ^ low) & EFER_LME != 0) {
+            trigger_gp(0);
+            return;
+        }
+        *efer = low & (EFER_SCE | EFER_LME | EFER_NXE);
+        dbg_log!("WRMSR EFER={:x}", *efer);
+    }
+    else if index == IA32_STAR {
+        *msr_star_low = low;
+        *msr_star_high = high;
+    }
+    else if index == IA32_LSTAR {
+        *msr_lstar_low = low;
+        *msr_lstar_high = high;
+    }
+    else if index == IA32_FMASK {
+        *msr_fmask = low;
+    }
     else if index == IA32_KERNEL_GS_BASE {
-        // Only used in 64 bit mode (by SWAPGS), but set by kvm-unit-test
-        dbg_log!("GS Base written");
+        *kernel_gs_base_low = low;
+        *kernel_gs_base_high = high;
     }
     else if index == IA32_PAT {
         //
@@ -1304,6 +1447,24 @@ pub unsafe fn instr_0F32() {
     }
     else if index == IA32_MCG_CAP {
         // netbsd
+    }
+    else if index == IA32_EFER {
+        low = *efer;
+    }
+    else if index == IA32_STAR {
+        low = *msr_star_low;
+        high = *msr_star_high;
+    }
+    else if index == IA32_LSTAR {
+        low = *msr_lstar_low;
+        high = *msr_lstar_high;
+    }
+    else if index == IA32_FMASK {
+        low = *msr_fmask;
+    }
+    else if index == IA32_KERNEL_GS_BASE {
+        low = *kernel_gs_base_low;
+        high = *kernel_gs_base_high;
     }
     else if index == IA32_PAT {
         //
@@ -3226,8 +3387,17 @@ pub unsafe fn instr_0FA2() {
 
         0x80000000 => {
             // maximum supported extended level
-            eax = 5;
-            // other registers are reserved
+            eax = 0x80000001u32 as i32;
+        },
+
+        0x80000001 => {
+            // Extended Processor Info and Feature Bits
+            eax = 0; // extended model info (not reported)
+            ebx = 0;
+            ecx = 1 << 0; // LAHF/SAHF in 64-bit mode
+            edx = 1 << 29 // Long Mode (LM) capable
+                | 1 << 11  // SYSCALL/SYSRET
+                | 1 << 20; // NX (Execute Disable)
         },
 
         0x40000000 => {

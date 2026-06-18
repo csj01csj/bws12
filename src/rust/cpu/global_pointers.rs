@@ -73,6 +73,28 @@ pub const sse_scratch_register: *mut reg128 = 1136 as *mut reg128;
 
 pub const fpu_st: *mut F80 = 1152 as *mut F80;
 
+// 64-bit Long Mode (x86-64) state - offsets match cpu.js mappings
+// fpu_st ends at 1152 + 8*12 = 1248 (F80 is 12 bytes in wasm32)
+pub const efer: *mut i32 = 1248 as *mut i32;          // EFER MSR (SCE|LME|LMA|NXE bits)
+pub const msr_star_low: *mut i32 = 1252 as *mut i32;  // STAR[31:0] (legacy SYSCALL EIP)
+pub const msr_lstar_low: *mut i32 = 1256 as *mut i32; // LSTAR[31:0] (64-bit SYSCALL target)
+pub const msr_lstar_high: *mut i32 = 1260 as *mut i32;// LSTAR[63:32]
+pub const msr_fmask: *mut i32 = 1264 as *mut i32;     // FMASK (applied to RFLAGS on SYSCALL)
+pub const is_64: *mut bool = 1268 as *mut bool;        // True when CPU is in 64-bit long mode
+
+// Internal Rust state (not mapped by JS)
+pub const rex_prefix: *mut i32 = 1272 as *mut i32;     // Current REX prefix byte (0 = none)
+pub const msr_star_high: *mut i32 = 1276 as *mut i32;  // STAR[63:32]: [63:48]=user CS, [47:32]=kernel CS
+pub const kernel_gs_base_low: *mut i32 = 1280 as *mut i32;
+pub const kernel_gs_base_high: *mut i32 = 1284 as *mut i32;
+
+// R8-R15 extended registers (low/high 32-bit halves)
+pub const reg_r8_low: *mut i32 = 1288 as *mut i32;    // R8-R15 bits 31:0  (8 × 4 = 32 bytes)
+pub const reg_r8_high: *mut i32 = 1320 as *mut i32;   // R8-R15 bits 63:32 (8 × 4 = 32 bytes)
+
+// High 32 bits of legacy registers RAX-RDI (for REX.W 64-bit ops)
+pub const reg64_high: *mut i32 = 1352 as *mut i32;    // rax-rdi bits 63:32 (8 × 4 = 32 bytes)
+
 pub fn get_reg32_offset(r: u32) -> u32 {
     dbg_assert!(r < 8);
     (unsafe { reg32.offset(r as isize) }) as u32

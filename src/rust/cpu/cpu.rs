@@ -2660,6 +2660,20 @@ pub unsafe fn set_cr0(cr0: i32) {
     }
 
     *protected_mode = (*cr & CR0_PE) == CR0_PE;
+
+    // Long mode activation: when PG is enabled with EFER.LME set, set EFER.LMA
+    if cr0 & CR0_PG != 0 && *efer & EFER_LME != 0 {
+        if *efer & EFER_LMA == 0 {
+            *efer |= EFER_LMA;
+            *is_64 = true;
+            dbg_log!("Long mode activated (EFER.LMA set)");
+        }
+    }
+    else if cr0 & CR0_PG == 0 && *efer & EFER_LMA != 0 {
+        *efer &= !EFER_LMA;
+        *is_64 = false;
+        dbg_log!("Long mode deactivated (EFER.LMA cleared)");
+    }
 }
 
 pub unsafe fn set_cr3(mut cr3: i32) {
@@ -2914,10 +2928,18 @@ pub unsafe fn cycle_internal() {
     else {
         *previous_ip = *instruction_pointer;
 
-        let opcode = return_on_pagefault!(read_imm8());
+        let raw_opcode = return_on_pagefault!(read_imm8());
+        let opcode = if *is_64 && raw_opcode >= 0x40 && raw_opcode <= 0x4F {
+            *rex_prefix = raw_opcode;
+            return_on_pagefault!(read_imm8())
+        }
+        else {
+            raw_opcode
+        };
         *instruction_counter += 1;
         dbg_assert!(*prefixes == 0);
         run_instruction(opcode | (*is_32 as i32) << 8);
+        if *is_64 { *rex_prefix = 0; }
         dbg_assert!(*prefixes == 0);
     }
 }
@@ -2942,11 +2964,19 @@ unsafe fn jit_run_interpreted(phys_addr: u32) {
     }
 
     jit_block_boundary = false;
-    let opcode = *mem8.offset(phys_addr as isize) as i32;
+    let first_byte = *mem8.offset(phys_addr as isize) as i32;
     *instruction_pointer += 1;
+    let opcode = if *is_64 && first_byte >= 0x40 && first_byte <= 0x4F {
+        *rex_prefix = first_byte;
+        return_on_pagefault!(read_imm8())
+    }
+    else {
+        first_byte
+    };
     *instruction_counter += 1;
     dbg_assert!(*prefixes == 0);
     run_instruction(opcode | (*is_32 as i32) << 8);
+    if *is_64 { *rex_prefix = 0; }
     dbg_assert!(*prefixes == 0);
 
     // We need to limit the number of iterations here as jumps within the same page are not counted
@@ -2960,7 +2990,14 @@ unsafe fn jit_run_interpreted(phys_addr: u32) {
             || (*previous_ip as u32) < (*instruction_pointer as u32))
     {
         *previous_ip = *instruction_pointer;
-        let opcode = return_on_pagefault!(read_imm8());
+        let raw_opcode = return_on_pagefault!(read_imm8());
+        let opcode = if *is_64 && raw_opcode >= 0x40 && raw_opcode <= 0x4F {
+            *rex_prefix = raw_opcode;
+            return_on_pagefault!(read_imm8())
+        }
+        else {
+            raw_opcode
+        };
 
         if CHECK_MISSED_ENTRY_POINTS {
             let phys_addr = return_on_pagefault!(get_phys_eip()) as u32;
@@ -2969,12 +3006,6 @@ unsafe fn jit_run_interpreted(phys_addr: u32) {
 
             if entry != jit::CachedCode::NONE {
                 profiler::stat_increment(RUN_INTERPRETED_MISSED_COMPILED_ENTRY_RUN_INTERPRETED);
-                //dbg_log!(
-                //    "missed entry point at {:x} prev_opcode={:x} opcode={:x}",
-                //    phys_addr,
-                //    prev_opcode,
-                //    opcode
-                //);
             }
         }
 
@@ -2988,6 +3019,7 @@ unsafe fn jit_run_interpreted(phys_addr: u32) {
 
         dbg_assert!(*prefixes == 0);
         run_instruction(opcode | (*is_32 as i32) << 8);
+        if *is_64 { *rex_prefix = 0; }
         dbg_assert!(*prefixes == 0);
 
         i += 1;
@@ -3000,7 +3032,8 @@ pub fn pack_current_state_flags() -> CachedStateFlags {
             (*is_32 as u32) << 0
                 | (*stack_size_32 as u32) << 1
                 | ((*cpl == 3) as u32) << 2
-                | (has_flat_segmentation() as u32) << 3,
+                | (has_flat_segmentation() as u32) << 3
+                | (*is_64 as u32) << 4,
         )
     }
 }
@@ -3721,7 +3754,55 @@ pub unsafe fn read_reg32(index: i32) -> i32 {
 pub unsafe fn write_reg32(index: i32, value: i32) {
     dbg_assert!(index >= 0 && index < 8);
     *reg32.offset(index as isize) = value;
+    // In 64-bit mode, writing 32-bit zero-extends to 64 bits (clears high 32 bits)
+    if *is_64 {
+        *reg64_high.offset(index as isize) = 0;
+    }
 }
+
+// Read/write the full 64-bit value of registers 0-7 (rax-rdi)
+pub unsafe fn read_reg64(index: i32) -> u64 {
+    dbg_assert!(index >= 0 && index < 8);
+    (*reg32.offset(index as isize) as u32 as u64)
+        | ((*reg64_high.offset(index as isize) as u32 as u64) << 32)
+}
+
+pub unsafe fn write_reg64(index: i32, value: u64) {
+    dbg_assert!(index >= 0 && index < 8);
+    *reg32.offset(index as isize) = value as i32;
+    *reg64_high.offset(index as isize) = (value >> 32) as i32;
+}
+
+// Read/write R8-R15 (indices 8-15)
+pub unsafe fn read_reg_r8(index: i32) -> u64 {
+    dbg_assert!(index >= 0 && index < 8);
+    (*reg_r8_low.offset(index as isize) as u32 as u64)
+        | ((*reg_r8_high.offset(index as isize) as u32 as u64) << 32)
+}
+
+pub unsafe fn write_reg_r8(index: i32, value: u64) {
+    dbg_assert!(index >= 0 && index < 8);
+    *reg_r8_low.offset(index as isize) = value as i32;
+    *reg_r8_high.offset(index as isize) = (value >> 32) as i32;
+}
+
+// Read/write R8-R15 low 32 bits
+pub unsafe fn read_reg_r8_low(index: i32) -> i32 {
+    dbg_assert!(index >= 0 && index < 8);
+    *reg_r8_low.offset(index as isize)
+}
+
+pub unsafe fn write_reg_r8_low(index: i32, value: i32) {
+    dbg_assert!(index >= 0 && index < 8);
+    *reg_r8_low.offset(index as isize) = value;
+    *reg_r8_high.offset(index as isize) = 0; // 32-bit write zero-extends
+}
+
+// REX prefix helpers
+pub unsafe fn rex_w() -> bool { *rex_prefix & 8 != 0 }  // REX.W = 64-bit operand size
+pub unsafe fn rex_r() -> bool { *rex_prefix & 4 != 0 }  // REX.R = extends ModRM.reg
+pub unsafe fn rex_x() -> bool { *rex_prefix & 2 != 0 }  // REX.X = extends SIB.index
+pub unsafe fn rex_b() -> bool { *rex_prefix & 1 != 0 }  // REX.B = extends ModRM.r/m or opcode reg
 
 pub unsafe fn read_mmx32s(r: i32) -> i32 { (*fpu_st.offset(r as isize)).mantissa as i32 }
 
@@ -4195,6 +4276,23 @@ pub unsafe fn reset_cpu() {
     *sysenter_cs = 0;
     *sysenter_esp = 0;
     *sysenter_eip = 0;
+
+    // Reset 64-bit long mode state
+    *efer = 0;
+    *msr_star_low = 0;
+    *msr_star_high = 0;
+    *msr_lstar_low = 0;
+    *msr_lstar_high = 0;
+    *msr_fmask = 0;
+    *is_64 = false;
+    *rex_prefix = 0;
+    *kernel_gs_base_low = 0;
+    *kernel_gs_base_high = 0;
+    for i in 0..8 {
+        *reg_r8_low.offset(i) = 0;
+        *reg_r8_high.offset(i) = 0;
+        *reg64_high.offset(i) = 0;
+    }
 
     *flags = FLAGS_DEFAULT;
     *flags_changed = 0;
