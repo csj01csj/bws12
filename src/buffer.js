@@ -1,1 +1,3 @@
-placeholder - will be replaced
+"use strict";
+
+// placeholder - reading actual content
