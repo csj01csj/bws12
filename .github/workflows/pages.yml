@@ -1,0 +1,93 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [claude/happy-gauss-snxuo5]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install NASM
+        run: sudo apt-get install -y nasm
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download Closure Compiler
+        run: |
+          mkdir -p closure-compiler
+          wget -q -O closure-compiler/compiler.jar \
+            https://repo1.maven.org/maven2/com/google/javascript/closure-compiler/v20220601/closure-compiler-v20220601.jar
+
+      - name: Build C dependencies
+        run: |
+          make build/softfloat.o build/zstddeclib.o
+
+      - name: Generate Rust code
+        run: |
+          node gen/generate_interpreter.js
+          node gen/generate_jit.js
+          node gen/generate_analyzer.js
+
+      - name: Build WASM
+        run: |
+          make build/v86.wasm
+
+      - name: Build JS
+        run: |
+          make build/v86_all.js
+
+      - name: Prepare site
+        run: |
+          mkdir -p _site
+          cp index.html _site/
+          cp v86.css _site/
+          cp -r build/ _site/build/
+          cp -r bios/ _site/bios/ 2>/dev/null || true
+          cp -r images/ _site/images/ 2>/dev/null || true
+          echo "v86-64.duckdns.org" > _site/CNAME
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
