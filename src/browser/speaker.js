@@ -20,7 +20,8 @@ function SpeakerAdapter(bus)
     }
 
     /** @type {AudioContext} */
-    var audio_context = new (AudioContext || webkitAudioContext)();
+    var AudioCtx = AudioContext || webkitAudioContext;
+    var audio_context = new AudioCtx();
 
     /** @type {boolean} */
     var audio_context_running = audio_context.state === "running";
